@@ -170,6 +170,29 @@ router.get('/', (req, res) => {
                 other: [
                     'GET /api/jav/tsunami/random'
                 ]
+            },
+            hentaimama: {
+                browse: [
+                    'GET /api/hen/mama/home',
+                    'GET /api/hen/mama/series/:page?',
+                    'GET /api/hen/mama/recent-episodes/:page?',
+                    'GET /api/hen/mama/new-monthly/:page?',
+                    'GET /api/hen/mama/tvshows/:page?'
+                ],
+                content: [
+                    'GET /api/hen/mama/info/:id',
+                    'GET /api/hen/mama/watch/:id'
+                ],
+                taxonomies: [
+                    'GET /api/hen/mama/genres',
+                    'GET /api/hen/mama/studios',
+                    'GET /api/hen/mama/genre/:genre/:page?',
+                    'GET /api/hen/mama/studio/:studio/:page?'
+                ],
+                search: [
+                    'GET /api/hen/mama/search/:query/:page?',
+                    'GET /api/hen/mama/advance-search?query=...&genre=...&studio=...&status=...&page=1'
+                ]
             }
         }
     });
@@ -308,6 +331,52 @@ router.get('/hen/mama/search/:query/:page?', (req, res) => {
     const query = req.params.query;
     const page = req.params.page ? parseInt(req.params.page, 10) : (parseInt(req.query.page, 10) || 1);
     handleResponse(res, hentaimama.searchHentaimama(query, page));
+});
+
+router.get('/hen/mama/genres', (req, res) => {
+    handleResponse(res, hentaimama.scrapeGenreList());
+});
+
+router.get('/hen/mama/studios', (req, res) => {
+    handleResponse(res, hentaimama.scrapeStudioList());
+});
+
+router.get('/hen/mama/genre/:genre/:page?', (req, res) => {
+    const genre = req.params.genre;
+    const page = req.params.page ? parseInt(req.params.page, 10) : (parseInt(req.query.page, 10) || 1);
+    handleResponse(res, hentaimama.scrapeGenrePage(genre, page));
+});
+
+router.get('/hen/mama/studio/:studio/:page?', (req, res) => {
+    const studio = req.params.studio;
+    const page = req.params.page ? parseInt(req.params.page, 10) : (parseInt(req.query.page, 10) || 1);
+    handleResponse(res, hentaimama.scrapeStudio(studio, page));
+});
+
+router.get('/hen/mama/new-monthly/:page?', (req, res) => {
+    const page = req.params.page ? parseInt(req.params.page, 10) : (parseInt(req.query.page, 10) || 1);
+    handleResponse(res, hentaimama.scrapeNewMonthlyHentai(page));
+});
+
+router.get('/hen/mama/recent-episodes/:page?', (req, res) => {
+    const page = req.params.page ? parseInt(req.params.page, 10) : (parseInt(req.query.page, 10) || 1);
+    handleResponse(res, hentaimama.scrapeRecentEpisodes(page));
+});
+
+router.get('/hen/mama/tvshows/:page?', (req, res) => {
+    const page = req.params.page ? parseInt(req.params.page, 10) : (parseInt(req.query.page, 10) || 1);
+    handleResponse(res, hentaimama.scrapeTVShowsArchive(page));
+});
+
+router.get('/hen/mama/advance-search', (req, res) => {
+    const filters = {
+        query: req.query.query || req.query.q,
+        genre: req.query.genre,
+        studio: req.query.studio,
+        status: req.query.status,
+        page: parseInt(req.query.page, 10) || 1
+    };
+    handleResponse(res, hentaimama.advanceSearch(filters));
 });
 
 // ==================== MANGAKAKALOT ENDPOINTS ====================
