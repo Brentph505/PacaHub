@@ -1,19 +1,29 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { enhanceServerWithMedia } = require('../../../utils/iframe/turbovidhls');
+const { enhanceServerWithMedia: enhanceTurboVid } = require('../../../utils/iframe/turbovidhls');
+const { enhanceServerWithMedia: enhanceHiCherri } = require('../../../utils/iframe/hicherri');
 
 const BASE_URL = 'https://javtsunami.com';
 const API_BASE = `${BASE_URL}/wp-json/wp/v2`;
 
-// Configure axios defaults with shorter timeout
+// ==================== CONFIGURATION ====================
+
 const axiosConfig = {
     headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     },
-    timeout: 8000 // Reduced from 15000
+    timeout: 8000
 };
 
-// ==================== ENHANCED CACHING SYSTEM ====================
+const DEFAULT_CONFIG = {
+    perPage: 20,
+    maxCacheSize: 500,
+    taxonomyCacheSize: 200,
+    imageConcurrency: 5,
+    imageTimeout: 5000
+};
+
+// ==================== CACHING SYSTEM ====================
 
 class LRUCache {
     constructor(maxSize = 500) {
@@ -24,7 +34,6 @@ class LRUCache {
     get(key) {
         if (!this.cache.has(key)) return null;
         const value = this.cache.get(key);
-        // Move to end (most recently used)
         this.cache.delete(key);
         this.cache.set(key, value);
         return value;
@@ -34,7 +43,6 @@ class LRUCache {
         if (this.cache.has(key)) {
             this.cache.delete(key);
         } else if (this.cache.size >= this.maxSize) {
-            // Remove oldest (first) entry
             const firstKey = this.cache.keys().next().value;
             this.cache.delete(firstKey);
         }
@@ -50,8 +58,8 @@ class LRUCache {
     }
 }
 
-const imageCache = new LRUCache(500);
-const taxonomyCache = new LRUCache(200);
+const imageCache = new LRUCache(DEFAULT_CONFIG.maxCacheSize);
+const taxonomyCache = new LRUCache(DEFAULT_CONFIG.taxonomyCacheSize);
 
 // ==================== UTILITY FUNCTIONS ====================
 
@@ -88,6 +96,75 @@ function cleanURL(url) {
     }
     return cleaned || null;
 }
+
+function extractVideoCode(title) {
+    const match = title.match(/([A-Z]+[-_\s]\d+)/i);
+    if (match) {
+        return match[1].toUpperCase().replace(/[_\s]/g, '-');
+    }
+    return null;
+}
+
+function extractSubtitleLanguages(tags) {
+    const languages = [];
+    tags.forEach(tag => {
+        const slug = tag.slug || tag.id || '';
+        if (slug.includes('english') || slug.includes('eng-sub')) {
+            languages.push('English');
+        }
+        if (slug.includes('thai') || slug.includes('ซับไทย')) {
+            languages.push('Thai');
+        }
+        if (slug.includes('indo') || slug.includes('indonesian')) {
+            languages.push('Indonesian');
+        }
+        if (slug.includes('chinese') || slug.includes('中文')) {
+            languages.push('Chinese');
+        }
+    });
+    return [...new Set(languages)];
+}
+
+// ==================== RESPONSE BUILDERS ====================
+
+function successResponse(data, pagination = null) {
+    const response = {
+        status: 'success',
+        data
+    };
+    if (pagination) {
+        response.pagination = pagination;
+    }
+    response.timestamp = new Date().toISOString();
+    return response;
+}
+
+function errorResponse(message, code = 'UNKNOWN_ERROR') {
+    return {
+        status: 'error',
+        error: {
+            message,
+            code
+        },
+        data: null,
+        timestamp: new Date().toISOString()
+    };
+}
+
+function buildPagination(currentPage, perPage, totalPages, totalItems) {
+    return {
+        currentPage: parseInt(currentPage),
+        perPage: parseInt(perPage),
+        totalPages: parseInt(totalPages),
+        totalItems: parseInt(totalItems),
+        hasNext: currentPage < totalPages,
+        hasPrev: currentPage > 1,
+        nextPage: currentPage < totalPages ? currentPage + 1 : null,
+        prevPage: currentPage > 1 ? currentPage - 1 : null
+    };
+}
+
+// ==================== IMAGE EXTRACTION ====================
 
 function extractImageFromAPI(post) {
     try {
@@ -137,197 +214,6 @@ async function fetchFeaturedImage(featuredMediaUrl) {
     }
 }
 
-function extractVideoCode(title) {
-    const match = title.match(/([A-Z]+-\d+)/i);
-    return match ? match[1].toUpperCase() : null;
-}
-
-function extractSubtitleLanguages(tags) {
-    const languages = [];
-    tags.forEach(tag => {
-        const slug = tag.slug || tag.id || '';
-        if (slug.includes('english') || slug.includes('eng-sub')) {
-            languages.push('English');
-        }
-        if (slug.includes('thai') || slug.includes('ซับไทย')) {
-            languages.push('Thai');
-        }
-        if (slug.includes('indo') || slug.includes('indonesian')) {
-            languages.push('Indonesian');
-        }
-        if (slug.includes('chinese') || slug.includes('中文')) {
-            languages.push('Chinese');
-        }
-    });
-    return [...new Set(languages)];
-}
-
-// ==================== OPTIMIZED IMAGE EXTRACTION ====================
-
-/**
- * Fast image extraction with timeout and fallback
- */
-async function scrapeTaxonomyImageOptimized(taxonomyType, slug) {
-    const urlMap = {
-        'actors': `${BASE_URL}/actor/${slug}`,
-        'categories': `${BASE_URL}/category/${slug}`,
-        'tags': `${BASE_URL}/tag/${slug}`
-    };
-    
-    const url = urlMap[taxonomyType] || `${BASE_URL}/${taxonomyType}/${slug}`;
-    
-    try {
-        // Use shorter timeout for scraping
-        const { data } = await axios.get(url, { 
-            ...axiosConfig, 
-            timeout: 5000 // 5 seconds max
-        });
-        const $ = cheerio.load(data);
-        
-        // Strategy 1: Open Graph image (fastest)
-        let image = $('meta[property="og:image"]').attr('content');
-        if (image && !image.includes('Best%2BJAV%2BActors.jpg')) {
-            return cleanURL(image);
-        }
-        
-        // Strategy 2: First article thumbnail (most reliable for actors)
-        const firstArticle = $('article.thumb-block').first();
-        if (firstArticle.length) {
-            image = firstArticle.find('img').attr('data-src') || 
-                    firstArticle.find('img').attr('src');
-            
-            if (image && !image.includes('px.gif') && !image.includes('placeholder')) {
-                return cleanURL(image);
-            }
-        }
-        
-        return null;
-    } catch (error) {
-        // Silently fail - don't log to avoid spam
-        return null;
-    }
-}
-
-/**
- * Controlled concurrency promise executor
- */
-async function processConcurrently(items, processor, concurrency = 3) {
-    const results = [];
-    const executing = [];
-    
-    for (const item of items) {
-        const promise = processor(item).then(result => {
-            executing.splice(executing.indexOf(promise), 1);
-            return result;
-        });
-        
-        results.push(promise);
-        executing.push(promise);
-        
-        if (executing.length >= concurrency) {
-            await Promise.race(executing);
-        }
-    }
-    
-    return Promise.all(results);
-}
-
-/**
- * OPTIMIZED: Enhanced taxonomy with lazy image loading
- */
-async function enhanceTaxonomyWithImage(term, taxonomyType, fetchImages = false) {
-    if (!term || !term.slug) return term;
-    
-    const baseTerm = {
-        id: term.id || term.slug,
-        name: term.name,
-        slug: term.slug,
-        count: term.count || 0,
-        thumbnail: null // Default to null
-    };
-    // Do not include description for actors
-    if (taxonomyType !== 'actors') {
-        baseTerm.description = term.description || '';
-    }
-    
-    // If not fetching images, return immediately
-    if (!fetchImages) {
-        return baseTerm;
-    }
-    
-    const cacheKey = `${taxonomyType}:${term.slug}`;
-    
-    // Check cache first
-    const cached = imageCache.get(cacheKey);
-    if (cached !== null) {
-        return {
-            ...baseTerm,
-            thumbnail: cached
-        };
-    }
-    
-    try {
-        let imageUrl = null;
-        
-        // Try to extract from description HTML if present (fastest)
-        if (term.description) {
-            const imgMatch = term.description.match(/<img[^>]+src="([^">]+)"/);
-            if (imgMatch && imgMatch[1] && !imgMatch[1].includes('Best%2BJAV%2BActors.jpg')) {
-                imageUrl = cleanURL(imgMatch[1]);
-            }
-        }
-        
-        // Only scrape if no image found and explicitly requested
-        if (!imageUrl) {
-            imageUrl = await scrapeTaxonomyImageOptimized(taxonomyType, term.slug);
-        }
-        
-        // Cache even null results to avoid re-fetching
-        imageCache.set(cacheKey, imageUrl);
-        
-        return {
-            ...baseTerm,
-            thumbnail: imageUrl
-        };
-    } catch (error) {
-        return baseTerm;
-    }
-}
-
-/**
- * OPTIMIZED: Batch enhance with controlled concurrency
- */
-async function enhanceTaxonomyListWithImages(terms, taxonomyType, fetchImages = false) {
-    if (!Array.isArray(terms) || terms.length === 0) return terms;
-    
-    // If not fetching images, return basic data immediately
-    if (!fetchImages) {
-        return terms.map(term => {
-            const base = {
-                id: term.id || term.slug,
-                name: term.name,
-                slug: term.slug,
-                count: term.count || 0,
-                thumbnail: null
-            };
-            // Omit description for actors
-            if (taxonomyType !== 'actors') {
-                base.description = term.description || '';
-            }
-            return base;
-        });
-    }
-    
-    // Process with concurrency limit of 5
-    return processConcurrently(
-        terms,
-        term => enhanceTaxonomyWithImage(term, taxonomyType, true),
-        5
-    );
-}
-
-// ==================== SCRAPING FUNCTIONS ====================
-
 async function scrapeImageFromPage(videoPath) {
     let realPath = videoPath;
     if (realPath.startsWith('/watch/')) {
@@ -356,6 +242,278 @@ async function scrapeImageFromPage(videoPath) {
         return null;
     }
 }
+
+async function scrapeTaxonomyImage(taxonomyType, slug) {
+    const urlMap = {
+        'actors': `${BASE_URL}/actor/${slug}`,
+        'categories': `${BASE_URL}/category/${slug}`,
+        'tags': `${BASE_URL}/tag/${slug}`
+    };
+    
+    const url = urlMap[taxonomyType] || `${BASE_URL}/${taxonomyType}/${slug}`;
+    
+    try {
+        const { data } = await axios.get(url, { 
+            ...axiosConfig, 
+            timeout: DEFAULT_CONFIG.imageTimeout
+        });
+        const $ = cheerio.load(data);
+        
+        // Try og:image first (if it's not a known placeholder)
+        let image = $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content');
+
+        const isPlaceholder = src => {
+            if (!src) return true;
+            const s = String(src).toLowerCase();
+            return s.includes('best%2bjav') || s.includes('best+jav') || s.includes('actors.jpg') || s.includes('no-image') || s.includes('placeholder') || s.includes('px.gif') || s.includes('default');
+        };
+
+        if (image && !isPlaceholder(image)) {
+            return cleanURL(image);
+        }
+
+        // Look for common image containers on taxonomy pages
+        const selectors = [
+            'article.thumb-block img',
+            '.category .thumb img',
+            '.category-image img',
+            '.term-thumbnail img',
+            '.archive-header img',
+            '.term-description img',
+            '.site-content img',
+            '.entry-content img'
+        ];
+
+        for (const sel of selectors) {
+            const el = $(sel).first();
+            if (el && el.length) {
+                // prefer lazy/data attributes
+                const candidates = [
+                    el.attr('data-src'),
+                    el.attr('data-lazy-src'),
+                    el.attr('data-original'),
+                    el.attr('data-srcset'),
+                    el.attr('srcset'),
+                    el.attr('src')
+                ];
+
+                for (const cand of candidates) {
+                    if (!cand) continue;
+                    // handle srcset by taking first URL
+                    let urlCandidate = cand;
+                    if (cand.includes(',')) {
+                        urlCandidate = cand.split(',')[0].trim().split(' ')[0];
+                    }
+                    if (!isPlaceholder(urlCandidate)) {
+                        return cleanURL(urlCandidate);
+                    }
+                }
+            }
+        }
+
+        // Try to extract background-image from inline styles
+        const bg = $('[style*="background-image"]').first().css('background-image');
+        if (bg && bg !== 'none') {
+            const m = String(bg).match(/url\(["']?(.*?)["']?\)/);
+            if (m && m[1] && !isPlaceholder(m[1])) {
+                return cleanURL(m[1]);
+            }
+        }
+
+        return null;
+    } catch (error) {
+        return null;
+    }
+}
+
+// ==================== CONCURRENT PROCESSING ====================
+
+async function processConcurrently(items, processor, concurrency = 3) {
+    const results = [];
+    const executing = [];
+    
+    for (const item of items) {
+        const promise = processor(item).then(result => {
+            executing.splice(executing.indexOf(promise), 1);
+            return result;
+        });
+        
+        results.push(promise);
+        executing.push(promise);
+        
+        if (executing.length >= concurrency) {
+            await Promise.race(executing);
+        }
+    }
+    
+    return Promise.all(results);
+}
+
+// ==================== TAXONOMY ENHANCEMENT ====================
+
+async function enhanceTaxonomyWithImage(term, taxonomyType, fetchImages = false) {
+    if (!term || !term.slug) return term;
+    
+    const baseTerm = {
+        name: term.name,
+        slug: term.slug,
+        count: term.count || 0
+    };
+    // Fetch images for categories and actors when requested
+    if ((taxonomyType === 'categories' || taxonomyType === 'actors') && fetchImages) {
+        const cacheKey = `${taxonomyType}:${term.slug}`;
+        const cached = imageCache.get(cacheKey);
+
+        if (cached !== null) {
+            return { ...baseTerm, thumbnail: cached };
+        }
+
+        try {
+            let imageUrl = null;
+
+            if (term.description) {
+                const imgMatch = term.description.match(/<img[^>]+src="([^">]+)"/);
+                if (imgMatch && imgMatch[1]) {
+                    imageUrl = cleanURL(imgMatch[1]);
+                }
+            }
+
+            if (!imageUrl) {
+                // scrapeTaxonomyImage supports actors/categories
+                imageUrl = await scrapeTaxonomyImage(taxonomyType === 'actors' ? 'actors' : 'categories', term.slug);
+            }
+
+            imageCache.set(cacheKey, imageUrl);
+            return { ...baseTerm, thumbnail: imageUrl };
+        } catch (error) {
+            return { ...baseTerm, thumbnail: null };
+        }
+    }
+
+    return baseTerm;
+}
+
+async function enhanceTaxonomyList(terms, taxonomyType, fetchImages = false) {
+    if (!Array.isArray(terms) || terms.length === 0) return [];
+    // For categories and actors with images, process concurrently
+    if ((taxonomyType === 'categories' || taxonomyType === 'actors') && fetchImages) {
+        return processConcurrently(
+            terms,
+            term => enhanceTaxonomyWithImage(term, taxonomyType, true),
+            DEFAULT_CONFIG.imageConcurrency
+        );
+    }
+
+    // Default mapping for other taxonomy lists
+    return terms.map(term => ({
+        name: term.name,
+        slug: term.slug,
+        count: term.count || 0
+    }));
+}
+
+// ==================== VIDEO DATA MAPPERS ====================
+
+function mapToVideoListItem(post, imageUrl) {
+    return {
+        id: post.slug,
+        title: cleanHTML(post.title.rendered),
+        thumbnail: imageUrl,
+        publishedAt: post.date,
+        modifiedAt: post.modified
+    };
+}
+
+async function mapToVideoDetails(post, slug) {
+    const tagsRaw = post._embedded?.['wp:term']?.[1] || [];
+    const tags = await enhanceTaxonomyList(
+        tagsRaw.map(tag => ({
+            name: tag.name,
+            slug: tag.slug,
+            count: tag.count || 0
+        })),
+        'tags',
+        false
+    );
+
+    const actorsRaw = post._embedded?.['wp:term']?.[2] || [];
+    const actors = await enhanceTaxonomyList(
+        actorsRaw.map(actor => ({
+            name: actor.name,
+            slug: actor.slug,
+            count: actor.count || 0
+        })),
+        'actors',
+        false
+    );
+
+    const categoriesRaw = post._embedded?.['wp:term']?.[0] || [];
+    const categories = await enhanceTaxonomyList(
+        categoriesRaw.map(cat => ({
+            name: cat.name,
+            slug: cat.slug,
+            count: cat.count || 0,
+            description: cat.description || ''
+        })),
+        'categories',
+        true  // Enable image fetching for categories
+    );
+
+    let thumbnail = extractImageFromAPI(post);
+    
+    if (!thumbnail && post._links?.['wp:featuredmedia']?.[0]?.href) {
+        thumbnail = await fetchFeaturedImage(post._links['wp:featuredmedia'][0].href);
+    }
+
+    if (!thumbnail) {
+        thumbnail = await scrapeImageFromPage(`/${slug}`);
+    }
+
+    const servers = await scrapeServersFromPage(`/${slug}`);
+    const { related_actors, related } = await scrapeRelatedContent(`/${slug}`);
+
+    return {
+        id: post.slug,
+        title: cleanHTML(post.title.rendered),
+        thumbnail,
+        thumbnailAlt: post._embedded?.['wp:featuredmedia']?.[0]?.alt_text || null,
+        publishedAt: post.date,
+        modifiedAt: post.modified,
+        author: {
+            id: post.author,
+            name: post._embedded?.author?.[0]?.name || null,
+            url: post._embedded?.author?.[0]?.link || null
+        },
+        fullUrl: `${BASE_URL}/${post.slug}.html`,
+        servers: servers.map(server => {
+            const { media, ...serverWithoutMedia } = server;
+            return {
+                ...serverWithoutMedia,
+                quality: server.quality || 'HD',
+                language: 'Japanese',
+                hasSubtitles: tags.some(t => 
+                    t.slug.includes('sub') || 
+                    t.slug.includes('subtitle')
+                )
+            };
+        }),
+        tags,
+        actors,
+        categories,
+        relatedActors: related_actors,
+        relatedVideos: related,
+        metadata: {
+            videoCode: extractVideoCode(post.title.rendered),
+            studio: categories.find(c => c.slug.includes('studio'))?.name || null,
+            releaseDate: post.date,
+            rating: post.meta?.rating || null,
+            language: 'Japanese',
+            subtitles: extractSubtitleLanguages(tags)
+        }
+    };
+}
+
+// ==================== SCRAPING FUNCTIONS ====================
 
 async function scrapeServersFromPage(videoPath) {
     let realPath = videoPath;
@@ -393,7 +551,13 @@ async function scrapeServersFromPage(videoPath) {
             }
         });
         
-        const enhancedServers = await enhanceServerWithMedia(servers);
+        if (servers.length === 0) {
+            return [];
+        }
+        
+        let enhancedServers = await enhanceTurboVid(servers);
+        enhancedServers = await enhanceHiCherri(enhancedServers);
+        enhancedServers = enhancedServers.filter(server => server && server.url);
         
         return enhancedServers;
     } catch (error) {
@@ -420,13 +584,28 @@ async function scrapeRelatedContent(videoPath) {
         $('.under-video-block .widget-title:contains("Related Actors Videos")').next('div').find('article').each((_, el) => {
             const $el = $(el);
             const a = $el.find('a').first();
+            const href = a.attr('href') || '';
             const imgSrc = $el.find('img').attr('data-src') || $el.find('img').attr('src');
+
+            // derive slug/id from href
+            let link = href ? cleanURL(href) : null;
+            let slug = null;
+            if (href) {
+                try {
+                    const path = href.replace(/https?:\/\/[\w\.-]+/i, '').split('?')[0];
+                    const parts = path.split('/').filter(Boolean);
+                    if (parts.length) {
+                        slug = parts.pop().replace(/\.html$/i, '');
+                    }
+                } catch (e) {
+                    slug = null;
+                }
+            }
+
             related_actors.push({
                 title: a.attr('title') || $el.find('.entry-header span').text().trim(),
-                url: a.attr('href'),
-                img: cleanURL(imgSrc),
-                duration: $el.find('.duration').text().trim(),
-                views: $el.find('.views').text().trim()
+                thumbnail: cleanURL(imgSrc),
+                id: slug
             });
         });
         
@@ -434,13 +613,28 @@ async function scrapeRelatedContent(videoPath) {
         $('.under-video-block .widget-title:contains("Related Videos")').next('div').find('article').each((_, el) => {
             const $el = $(el);
             const a = $el.find('a').first();
+            const href = a.attr('href') || '';
             const imgSrc = $el.find('img').attr('data-src') || $el.find('img').attr('src');
+
+            let link = href ? cleanURL(href) : null;
+            let slug = null;
+            if (href) {
+                try {
+                    const path = href.replace(/https?:\/\/[\w\.-]+/i, '').split('?')[0];
+                    const parts = path.split('/').filter(Boolean);
+                    if (parts.length) {
+                        // If last part looks like a slug (may end with .html)
+                        slug = parts.pop().replace(/\.html$/i, '');
+                    }
+                } catch (e) {
+                    slug = null;
+                }
+            }
+
             related.push({
                 title: a.attr('title') || $el.find('.entry-header span').text().trim(),
-                url: a.attr('href'),
-                img: cleanURL(imgSrc),
-                duration: $el.find('.duration').text().trim(),
-                views: $el.find('.views').text().trim()
+                thumbnail: cleanURL(imgSrc),
+                id: slug
             });
         });
         
@@ -451,7 +645,7 @@ async function scrapeRelatedContent(videoPath) {
     }
 }
 
-// ==================== MAIN API FUNCTIONS ====================
+// ==================== API FUNCTIONS ====================
 
 async function getVideoDetails(slug) {
     try {
@@ -461,123 +655,13 @@ async function getVideoDetails(slug) {
         );
 
         if (!data || data.length === 0) {
-            return {
-                success: false,
-                error: 'Video not found',
-                data: null
-            };
+            return errorResponse('Video not found', 'VIDEO_NOT_FOUND');
         }
 
-        const post = data[0];
-        
-        // Process tags (now WITH images by default)
-        const tagsRaw = post._embedded?.['wp:term']?.[1] || [];
-        const tags = await enhanceTaxonomyListWithImages(
-            tagsRaw.map(tag => ({
-                id: tag.slug,
-                name: tag.name,
-                slug: tag.slug,
-                count: tag.count || 0,
-                description: tag.description || ''
-            })),
-            'tags',
-            true // Fetch images by default for detail page
-        );
-
-        // Process actors WITH images (only for detail page)
-        const actorsRaw = post._embedded?.['wp:term']?.[2] || [];
-        const actors = await enhanceTaxonomyListWithImages(
-            actorsRaw.map(actor => ({
-                id: actor.slug,
-                name: actor.name,
-                slug: actor.slug,
-                count: actor.count || 0
-            })),
-            'actors',
-            true // Fetch images for detail page
-        );
-
-        // Process categories WITH images (only for detail page)
-        const categoriesRaw = post._embedded?.['wp:term']?.[0] || [];
-        const categories = await enhanceTaxonomyListWithImages(
-            categoriesRaw.map(cat => ({
-                id: cat.slug,
-                name: cat.name,
-                slug: cat.slug,
-                count: cat.count || 0,
-                description: cat.description || ''
-            })),
-            'categories',
-            true // Fetch images for detail page
-        );
-
-        let posterUrl = extractImageFromAPI(post);
-        
-        if (!posterUrl && post._links?.['wp:featuredmedia']?.[0]?.href) {
-            posterUrl = await fetchFeaturedImage(post._links['wp:featuredmedia'][0].href);
-        }
-
-        if (!posterUrl) {
-            posterUrl = await scrapeImageFromPage(`/${slug}`);
-        }
-
-        const servers = await scrapeServersFromPage(`/${slug}`);
-        const { related_actors, related } = await scrapeRelatedContent(`/${slug}`);
-
-        return {
-            success: true,
-            data: {
-                id: post.slug,
-                title: cleanHTML(post.title.rendered),
-                description: cleanHTML(post.excerpt.rendered),
-                content: cleanHTML(post.content.rendered),
-                poster: posterUrl,
-                img: posterUrl,
-                thumbnail: posterUrl,
-                thumbnailAlt: post._embedded?.['wp:featuredmedia']?.[0]?.alt_text || null,
-                duration: post.meta?.duration || null,
-                views: post.meta?.views ? parseInt(post.meta.views) : null,
-                publishedAt: post.date,
-                modifiedAt: post.modified,
-                author: {
-                    id: post.author,
-                    name: post._embedded?.author?.[0]?.name || null,
-                    url: post._embedded?.author?.[0]?.link || null
-                },
-                url: `/watch/${post.slug}`,
-                fullUrl: `${BASE_URL}/${post.slug}.html`,
-                servers: servers.map(server => ({
-                    ...server,
-                    quality: 'HD',
-                    language: 'Japanese',
-                    hasSubtitles: tags.some(t => 
-                        t.slug.includes('sub') || 
-                        t.slug.includes('subtitle')
-                    )
-                })),
-                tags,
-                actors,
-                categories,
-                cast: actors,
-                makers: [],
-                related_actors,
-                related,
-                metadata: {
-                    videoCode: extractVideoCode(post.title.rendered),
-                    studio: categories.find(c => c.slug.includes('studio'))?.name || null,
-                    releaseDate: post.date,
-                    rating: post.meta?.rating || null,
-                    language: 'Japanese',
-                    subtitles: extractSubtitleLanguages(tags)
-                }
-            }
-        };
+        const videoData = await mapToVideoDetails(data[0], slug);
+        return successResponse(videoData);
     } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            data: null
-        };
+        return errorResponse(error.message, 'API_ERROR');
     }
 }
 
@@ -591,8 +675,6 @@ async function getVideoList(page = 1, perPage = 20, filter = 'latest', category 
             _embed: true
         };
 
-        let endpoint = `${API_BASE}/posts`;
-        
         if (category) {
             const { data: categories } = await axios.get(
                 `${API_BASE}/categories?slug=${category}`, 
@@ -624,7 +706,7 @@ async function getVideoList(page = 1, perPage = 20, filter = 'latest', category 
         }
 
         const { data, headers } = await axios.get(
-            `${endpoint}?${buildQuery(params)}`, 
+            `${API_BASE}/posts?${buildQuery(params)}`, 
             axiosConfig
         );
 
@@ -638,47 +720,15 @@ async function getVideoList(page = 1, perPage = 20, filter = 'latest', category 
                 imageUrl = await fetchFeaturedImage(post._links['wp:featuredmedia'][0].href);
             }
 
-            return {
-                id: post.slug,
-                title: cleanHTML(post.title.rendered),
-                img: imageUrl,
-                thumbnail: imageUrl,
-                poster: imageUrl,
-                duration: post.meta?.duration || null,
-                views: post.meta?.views ? parseInt(post.meta.views) : null,
-                url: `/watch/${post.slug}`,
-                publishedAt: post.date,
-                modifiedAt: post.modified
-            };
+            return mapToVideoListItem(post, imageUrl);
         }));
 
-        return {
-            success: true,
-            page,
-            total: videos.length,
-            totalPages,
-            totalItems,
-            pagination: {
-                currentPage: page,
-                perPage,
-                totalPages,
-                totalItems,
-                hasNext: page < totalPages,
-                hasPrev: page > 1
-            },
+        return successResponse(
             videos,
-            data: videos
-        };
+            buildPagination(page, perPage, totalPages, totalItems)
+        );
     } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            page,
-            total: 0,
-            totalPages: 0,
-            videos: [],
-            data: []
-        };
+        return errorResponse(error.message, 'API_ERROR');
     }
 }
 
@@ -706,108 +756,51 @@ async function searchVideos(query, page = 1, perPage = 20) {
                 imageUrl = await fetchFeaturedImage(post._links['wp:featuredmedia'][0].href);
             }
 
-            return {
-                id: post.slug,
-                title: cleanHTML(post.title.rendered),
-                img: imageUrl,
-                thumbnail: imageUrl,
-                poster: imageUrl,
-                duration: post.meta?.duration || null,
-                views: post.meta?.views ? parseInt(post.meta.views) : null,
-                url: `/watch/${post.slug}`,
-                publishedAt: post.date,
-                modifiedAt: post.modified
-            };
+            return mapToVideoListItem(post, imageUrl);
         }));
 
-        return {
-            success: true,
-            query,
-            page,
-            total: videos.length,
-            totalPages,
-            totalItems,
-            pagination: {
-                currentPage: page,
-                perPage,
-                totalPages,
-                totalItems,
-                hasNext: page < totalPages,
-                hasPrev: page > 1
-            },
+        const response = successResponse(
             videos,
-            data: videos
-        };
+            buildPagination(page, perPage, totalPages, totalItems)
+        );
+        response.query = query;
+        
+        return response;
     } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            query,
-            page,
-            total: 0,
-            totalPages: 0,
-            videos: [],
-            data: []
-        };
+        return errorResponse(error.message, 'SEARCH_ERROR');
     }
 }
 
-/**
- * OPTIMIZED: Get tags without images by default
- */
-async function getTags(page = 1, perPage = 100, includeImages = true) {
+async function getTags(page = 1, perPage = 100) {
     try {
-        let allTags = [];
-        let totalPages = 1;
+        const { data, headers } = await axios.get(
+            `${API_BASE}/tags?page=${page}&per_page=${perPage}`, 
+            axiosConfig
+        );
 
-        do {
-            const { data, headers } = await axios.get(
-                `${API_BASE}/tags?page=${page}&per_page=${perPage}`, 
-                axiosConfig
-            );
+        const totalPages = parseInt(headers['x-wp-totalpages'] || 1);
+        const totalItems = parseInt(headers['x-wp-total'] || 0);
 
-            totalPages = parseInt(headers['x-wp-totalpages'] || 1);
-            allTags = allTags.concat(data);
-            page++;
-        } while (page <= totalPages);
-
-        // Only fetch images if explicitly requested
-        const tags = await enhanceTaxonomyListWithImages(
-            allTags.map(tag => ({
-                id: tag.slug,
+        const tags = await enhanceTaxonomyList(
+            data.map(tag => ({
                 name: tag.name,
                 slug: tag.slug,
                 count: tag.count || 0
-                // Removed "thumbnail" and "description" for faster processing
             })),
             'tags',
-            includeImages
+            false
         );
 
-        return {
-            success: true,
-            pagination: {
-                currentPage: page - 1,
-                perPage,
-                totalPages,
-                hasNext: page <= totalPages,
-                hasPrev: page > 1
-            },
-            data: tags
-        };
+        return successResponse(
+            tags,
+            buildPagination(page, perPage, totalPages, totalItems)
+        );
     } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            data: []
-        };
+        return errorResponse(error.message, 'API_ERROR');
     }
 }
 
-/**
- * OPTIMIZED: Get categories without images by default
- */
-async function getCategories(page = 1, perPage = 100, includeImages = true) {
+async function getCategories(page = 1, perPage = 100) {
     try {
         const { data, headers } = await axios.get(
             `${API_BASE}/categories?page=${page}&per_page=${perPage}`, 
@@ -815,193 +808,88 @@ async function getCategories(page = 1, perPage = 100, includeImages = true) {
         );
 
         const totalPages = parseInt(headers['x-wp-totalpages'] || 1);
+        const totalItems = parseInt(headers['x-wp-total'] || 0);
 
-        // Only fetch images if explicitly requested
-        const categories = await enhanceTaxonomyListWithImages(
+        const categories = await enhanceTaxonomyList(
             data.map(cat => ({
-                id: cat.slug,
                 name: cat.name,
                 slug: cat.slug,
                 count: cat.count || 0,
-                url: cat.link,
                 description: cat.description || ''
             })),
             'categories',
-            includeImages
+            true  // Enable image fetching for categories
         );
 
-        return {
-            success: true,
-            pagination: {
-                currentPage: page,
-                perPage,
-                totalPages,
-                hasNext: page < totalPages,
-                hasPrev: page > 1
-            },
-            data: categories
-        };
+        return successResponse(
+            categories,
+            buildPagination(page, perPage, totalPages, totalItems)
+        );
     } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            data: []
-        };
+        return errorResponse(error.message, 'API_ERROR');
     }
 }
 
-/**
- * OPTIMIZED: Get actors with images by default
- */
-async function getActors(page = 1, perPage = 20, includeImages = true, search = null) {
+async function getActors(page = 1, perPage = 20, search = null) {
     try {
-        // Build query params for actors endpoint, include search when provided
-        const params = {
-            page,
-            per_page: perPage,
-        };
+        const params = { page, per_page: perPage };
         if (search) params.search = search;
         
-        const resp = await axios.get(
+        const { data, headers } = await axios.get(
             `${API_BASE}/actors?${buildQuery(params)}`, 
             axiosConfig
         );
 
-        let { data } = resp;
-        const headers = resp.headers;
         const totalPages = parseInt(headers['x-wp-totalpages'] || 1);
+        const totalItems = parseInt(headers['x-wp-total'] || 0);
 
-        // If API returned fewer items than requested and there are more pages,
-        // try to fetch additional pages until we have perPage items or run out.
-        if (Array.isArray(data) && data.length > 0 && data.length < perPage && totalPages > page) {
-            const needed = perPage - data.length;
-            const pagesToFetch = [];
-            let p = page + 1;
-            while (p <= totalPages && pagesToFetch.length * perPage < needed) {
-                pagesToFetch.push(p);
-                p++;
-            }
-            if (pagesToFetch.length) {
-                const requests = pagesToFetch.map(pnum => axios.get(
-                    `${API_BASE}/actors?${buildQuery({ page: pnum, per_page: perPage, ...(search ? { search } : {}) })}`,
-                    axiosConfig
-                ).then(r => Array.isArray(r.data) ? r.data : []).catch(() => []));
-                const results = await Promise.all(requests);
-                results.forEach(arr => data = data.concat(arr));
-                if (data.length > perPage) data = data.slice(0, perPage);
-            }
-        }
-
-        // Always fetch images by default for actors
-        const actors = await enhanceTaxonomyListWithImages(
+        const actors = await enhanceTaxonomyList(
             data.map(actor => ({
-                id: actor.slug,
                 name: actor.name,
                 slug: actor.slug,
-                count: actor.count || 0
+                count: actor.count || 0,
+                description: actor.description || ''
             })),
             'actors',
-            true  // Changed to true - always fetch images by default
+            true // enable image/photo fetching for actors
         );
 
-        return {
-            success: true,
-            pagination: {
-                currentPage: page,
-                perPage,
-                totalPages,
-                hasNext: page < totalPages,
-                hasPrev: page > 1
-            },
-            data: actors
-        };
+        return successResponse(
+            actors,
+            buildPagination(page, perPage, totalPages, totalItems)
+        );
     } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            data: []
-        };
-    }
-}
-
-async function getPageInfo(type, identifier = null, page = 1, filter = 'latest') {
-    try {
-        let totalPages = 1;
-        
-        if (type === 'search') {
-            const result = await searchVideos(identifier, page, 1);
-            totalPages = result.totalPages;
-        } else if (type === 'category') {
-            const result = await getVideoList(page, 1, filter, identifier);
-            totalPages = result.totalPages;
-        } else if (type === 'tag') {
-            const result = await getVideoList(page, 1, filter, null, identifier);
-            totalPages = result.totalPages;
-        } else if (type === 'actor') {
-            const result = await getVideoList(page, 1, filter, null, null, identifier);
-            totalPages = result.totalPages;
-        } else {
-            const result = await getVideoList(page, 1, filter);
-            totalPages = result.totalPages;
-        }
-
-        return {
-            currentPage: page,
-            totalPages,
-            hasNextPage: page < totalPages,
-            hasPrevPage: page > 1,
-            nextPage: page < totalPages ? page + 1 : null,
-            prevPage: page > 1 ? page - 1 : null
-        };
-    } catch (error) {
-        return {
-            currentPage: page,
-            totalPages: 1,
-            hasNextPage: false,
-            hasPrevPage: false,
-            nextPage: null,
-            prevPage: null
-        };
+        return errorResponse(error.message, 'API_ERROR');
     }
 }
 
 // ==================== EXPORTS ====================
 
 module.exports = {
+    // Primary API methods
     getVideoDetails,
     getVideoList,
     searchVideos,
     getTags,
     getCategories,
     getActors,
-    getPageInfo,
     
-    // Backward compatibility aliases
-    scrapeWatch: (slug) => getVideoDetails(slug.replace('/watch/', '').replace('.html', '')),
-    scrapeLatest: (page, filter) => getVideoList(page, 20, filter),
-    scrapeFeatured: (page, filter) => getVideoList(page, 20, filter, 'featured'),
-    scrapeCategory: (category, page, filter) => getVideoList(page, 20, filter, category),
-    scrapeTag: (tag, page, filter) => getVideoList(page, 20, filter, null, tag),
-    scrapeSearch: (query, page) => searchVideos(query, page),
-    scrapeTagList: (includeImages = false) => getTags(1, 100, includeImages),
-    scrapeCategoryPage: (category, page, filter) => getVideoList(page, 20, filter, category),
-    getPostsByCategory: (category, page, perPage) => getVideoList(page, perPage || 20, 'latest', category),
-    getPostsByTag: (tag, page, perPage) => getVideoList(page, perPage || 20, 'latest', null, tag),
-    getPostsByActor: (actor, page, perPage) => getVideoList(page, perPage || 20, 'latest', null, null, actor),
-    
-    // Utility functions for direct access
-    clearImageCache: () => {
+    // Cache management
+    clearCache: () => {
         imageCache.clear();
         taxonomyCache.clear();
     },
-    getImageCacheSize: () => imageCache.size,
-    getTaxonomyCacheSize: () => taxonomyCache.size,
+    getCacheStats: () => ({
+        imageCache: imageCache.size,
+        taxonomyCache: taxonomyCache.size
+    }),
     
-    // New optimized methods with explicit image control
-    getActorsWithImages: (page = 1, perPage = 20, search = null) => getActors(page, perPage, true, search),
-    getCategoriesWithImages: (page = 1, perPage = 100) => getCategories(page, perPage, true),
-    getTagsWithImages: (page = 1, perPage = 100) => getTags(page, perPage, true),
-
-    // Actor search helper - also with images by default
-    searchActors: (query, page = 1, perPage = 20, includeImages = true) => getActors(page, perPage, includeImages, query)
+    // Backward compatibility
+    scrapeWatch: (slug) => getVideoDetails(slug.replace('/watch/', '').replace('.html', '')),
+    scrapeLatest: (page, filter) => getVideoList(page, 20, filter),
+    scrapeSearch: (query, page) => searchVideos(query, page),
+    scrapeTagList: () => getTags(1, 100),
+    getPostsByCategory: (category, page, perPage) => getVideoList(page, perPage || 20, 'latest', category),
+    getPostsByTag: (tag, page, perPage) => getVideoList(page, perPage || 20, 'latest', null, tag),
+    getPostsByActor: (actor, page, perPage) => getVideoList(page, perPage || 20, 'latest', null, null, actor)
 };
