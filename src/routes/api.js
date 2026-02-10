@@ -547,18 +547,16 @@ router.get('/jav/tsunami/actors/search', (req, res) => {
     
     const page = parseInt(req.query.page, 10) || 1;
     const perPage = parseInt(req.query.per_page, 10) || 20;
-    const includeImages = req.query.images === 'true' || req.query.images === '1';
     
-    handleResponse(res, javtsunami.getActors(page, perPage, includeImages, query));
+    handleResponse(res, javtsunami.getActors(page, perPage, query));
 });
 
 router.get('/jav/tsunami/actors', (req, res) => {
     const page = parseInt(req.query.page, 10) || 1;
     const perPage = parseInt(req.query.per_page, 10) || 20;
-    const includeImages = req.query.images === 'true' || req.query.images === '1';
     const search = (req.query.q || req.query.search || '').trim() || null;
     
-    handleResponse(res, javtsunami.getActors(page, perPage, includeImages, search));
+    handleResponse(res, javtsunami.getActors(page, perPage, search));
 });
 
 router.get('/jav/tsunami/search', (req, res) => {
