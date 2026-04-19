@@ -2,6 +2,8 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { enhanceServerWithMedia: enhanceTurboVid } = require('../../../utils/iframe/turbovidhls');
 const { enhanceServerWithMedia: enhanceHiCherri } = require('../../../utils/iframe/hicherri');
+const { enhanceServerWithMedia: enhanceFapSharing } = require('../../../utils/iframe/fapsharing');
+const { enhanceServerWithMedia: enhanceDoodStream } = require('../../../utils/iframe/vide0net');
 
 const BASE_URL = 'https://javtsunami.com';
 const API_BASE = `${BASE_URL}/wp-json/wp/v2`;
@@ -595,6 +597,8 @@ async function scrapeServersFromPage(videoPath) {
                 else if (src.includes('hicherri')) serverType = 'HiCherri';
                 else if (src.includes('streamtape')) serverType = 'StreamTape';
                 else if (src.includes('doodstream')) serverType = 'DoodStream';
+                else if (src.includes('vide0.net')) serverType = 'DoodStream';
+                else if (src.includes('playmogo.com')) serverType = 'DoodStream';
                 else if (src.includes('cloudrls')) serverType = 'CloudRLS';
                 else if (src.includes('turbovid')) serverType = 'TurboVid';
                 
@@ -614,6 +618,8 @@ async function scrapeServersFromPage(videoPath) {
         
         let enhancedServers = await enhanceTurboVid(servers);
         enhancedServers = await enhanceHiCherri(enhancedServers);
+        enhancedServers = await enhanceFapSharing(enhancedServers);
+        enhancedServers = await enhanceDoodStream(enhancedServers);
         enhancedServers = enhancedServers.filter(server => server && server.url);
         
         return enhancedServers;

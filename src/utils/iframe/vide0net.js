@@ -16,6 +16,7 @@ function isDoodStreamURL(url) {
     return url.includes('doodstream.com') || 
            url.includes('dood.') || 
            url.includes('vide0.net') ||
+           url.includes('playmogo.com') ||
            url.includes('dood');
 }
 
@@ -71,10 +72,9 @@ async function extractDoodStreamVideo(url) {
 
         const $ = cheerio.load(html);
 
-        // Method 1: Look for pass_md5 endpoint pattern
+        // Method 1: Look for pass_md5 endpoint pattern (highest priority for live sites)
         const scripts = $('script:not([src])');
         let passMd5Url = null;
-        let tokenValue = null;
 
         for (let i = 0; i < scripts.length; i++) {
             const scriptContent = $(scripts[i]).html();
@@ -85,13 +85,15 @@ async function extractDoodStreamVideo(url) {
             if (passMd5Match) {
                 passMd5Url = passMd5Match[0];
                 if (CONFIG.debug) console.log('[DoodStream] Found pass_md5 URL:', passMd5Url);
+                break;
             }
 
             // Look for token in $.get() calls
-            const tokenMatch = scriptContent.match(/\$\.get\(['"]([^'"]+)['"]/);
-            if (tokenMatch && tokenMatch[1].includes('pass_md5')) {
+            const tokenMatch = scriptContent.match(/\$\.get\(['"](\/pass_md5\/[^'"]+)['"]/);
+            if (tokenMatch) {
                 passMd5Url = tokenMatch[1];
                 if (CONFIG.debug) console.log('[DoodStream] Found token URL:', passMd5Url);
+                break;
             }
         }
 
@@ -107,7 +109,8 @@ async function extractDoodStreamVideo(url) {
                 const { data: tokenData } = await axios.get(fullUrl, {
                     headers: {
                         ...headers,
-                        'X-Requested-With': 'XMLHttpRequest'
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': url
                     },
                     timeout: CONFIG.timeout
                 });
@@ -119,7 +122,7 @@ async function extractDoodStreamVideo(url) {
                         : tokenData.url || tokenData.download_url;
 
                     if (videoUrl && validateVideoURL(videoUrl)) {
-                        if (CONFIG.debug) console.log('[DoodStream] Successfully extracted video URL');
+                        if (CONFIG.debug) console.log('[DoodStream] Successfully extracted video URL from pass_md5');
                         return createSuccessResult(videoUrl, false);
                     }
                 }
@@ -128,40 +131,31 @@ async function extractDoodStreamVideo(url) {
             }
         }
 
-        // Method 2: Look for direct video URLs in various patterns
-        const videoPatterns = [
-            /https?:\/\/[^\s"'<>]*\.mp4[^\s"'<>]*/gi,
-            /https?:\/\/[^\s"'<>]*\.m3u8[^\s"'<>]*/gi,
-            /"url"\s*:\s*"([^"]+)"/gi,
-            /"file"\s*:\s*"([^"]+)"/gi,
-            /dstorage[^"']+/gi
-        ];
-
-        for (let i = 0; i < scripts.length; i++) {
-            const scriptContent = $(scripts[i]).html();
-            if (!scriptContent) continue;
-
-            for (const pattern of videoPatterns) {
-                const matches = scriptContent.match(pattern);
-                if (matches) {
-                    for (const match of matches) {
-                        const cleanUrl = validateVideoURL(match.replace(/["']/g, ''));
-                        if (cleanUrl && !cleanUrl.includes('doubleclick') && !cleanUrl.includes('google-analytics')) {
-                            if (CONFIG.debug) console.log('[DoodStream] Found video URL via pattern matching');
-                            return createSuccessResult(cleanUrl, cleanUrl.includes('.m3u8'));
-                        }
-                    }
-                }
+        // Method 2: Look for direct video src in HTML (fallback)
+        const videoSrcMatch = html.match(/<video[^>]*src=["']([^"']+)["'][^>]*>/i);
+        if (videoSrcMatch) {
+            const videoUrl = videoSrcMatch[1];
+            if (CONFIG.debug) console.log('[DoodStream] Found video src in HTML:', videoUrl);
+            const cleanUrl = validateVideoURL(videoUrl);
+            if (cleanUrl) {
+                if (CONFIG.debug) console.log('[DoodStream] Successfully extracted from HTML src');
+                return createSuccessResult(cleanUrl, videoUrl.includes('.m3u8'));
+            } else {
+                if (CONFIG.debug) console.log('[DoodStream] Video URL failed validation:', videoUrl);
             }
         }
 
-        // Method 3: Extract from data attributes
+        // Method 3: Extract from data attributes and src attribute
         const videoElement = $('video, source, [data-src], [data-url]');
+        if (CONFIG.debug) console.log('[DoodStream] Found', videoElement.length, 'video elements');
+
         if (videoElement.length) {
-            const videoUrl = videoElement.attr('src') || 
-                           videoElement.attr('data-src') || 
+            const videoUrl = videoElement.attr('src') ||
+                           videoElement.attr('data-src') ||
                            videoElement.attr('data-url');
-            
+
+            if (CONFIG.debug) console.log('[DoodStream] Video element src:', videoUrl);
+
             if (videoUrl) {
                 const cleanUrl = validateVideoURL(videoUrl);
                 if (cleanUrl) {
