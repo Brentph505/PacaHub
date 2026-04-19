@@ -33,6 +33,31 @@ function decodeNHPlayerParam(base64Str) {
     }
 }
 
+function appendQueryParams(url, params) {
+    if (!params || Object.keys(params).length === 0) {
+        return url;
+    }
+
+    try {
+        const parsed = new URL(url);
+        Object.entries(params).forEach(([key, value]) => {
+            if (value != null && !parsed.searchParams.has(key)) {
+                parsed.searchParams.set(key, value);
+            }
+        });
+        return parsed.href;
+    } catch (e) {
+        const query = Object.entries(params)
+            .filter(([, value]) => value != null)
+            .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+            .join('&');
+        if (!query) {
+            return url;
+        }
+        return url + (url.includes('?') ? '&' : '?') + query;
+    }
+}
+
 /**
  * Parse nhplayer.com URL and extract video parameters
  */
@@ -55,6 +80,12 @@ function parseNHPlayerUrl(playerUrl) {
                 params.timestamp = parts[1];
                 params.hash = parts[2];
             }
+        }
+
+        if (url.searchParams.has('verify') && params.videoUrl && !params.videoUrl.includes('verify=')) {
+            params.videoUrl = appendQueryParams(params.videoUrl, {
+                verify: url.searchParams.get('verify')
+            });
         }
 
         // Decode subtitle URL
@@ -141,11 +172,23 @@ function extractVideoFromHtml(html, playerUrl) {
                 try {
                     const decoded = decodeNHPlayerParam(match[1]);
                     if (decoded) {
-                        // Check if decoded string contains a video URL
-                        const urlMatch = decoded.match(/(https?:\/\/[^\s|"']+\.(?:mp4|m3u8))/i);
+                        // Check if decoded string contains a video URL and preserve query params
+                        const urlMatch = decoded.match(/(https?:\/\/[^"]*?\.(?:mp4|m3u8)(?:\?[^"']*)?)/i);
                         if (urlMatch) {
                             video = urlMatch[1];
                             console.log('Extracted video from base64:', video.substring(0, 100));
+
+                            if (playerUrl && playerUrl.includes('verify=') && !video.includes('verify=')) {
+                                try {
+                                    const playerUrlObj = new URL(playerUrl);
+                                    const verifyValue = playerUrlObj.searchParams.get('verify');
+                                    if (verifyValue) {
+                                        video = appendQueryParams(video, { verify: verifyValue });
+                                    }
+                                } catch (e) {
+                                    // ignore malformed playerUrl
+                                }
+                            }
                             
                             // Also check for subtitle in the same base64 string
                             const srtMatch = decoded.match(/(https?:\/\/[^\s|"']+\.srt)/i);

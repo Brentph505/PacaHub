@@ -3,7 +3,8 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 
-const BASE_URL = 'https://hentairead.io';
+const BASE_URL = 'https://hentairead.to';
+const FALLBACK_URL = 'https://hentairead.io';
 
 const DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -107,57 +108,6 @@ function extractPagination($, currentPage) {
     return { page: currentPage, totalPages: lastPage };
 }
 
-function buildSearchUrl({ query, status = 'all', sortBy = 'lastest-manga', page = 1 } = {}) {
-    const params = [];
-    params.push('act=search');
-    params.push(`f[status]=${encodeURIComponent(status)}`);
-    params.push(`f[sortby]=${encodeURIComponent(sortBy)}`);
-    if (query) params.push(`f[keyword]=${encodeURIComponent(query)}`);
-    if (page > 1) params.push(`pageNum=${page}`);
-    return `${BASE_URL}/?${params.join('&')}`;
-}
-
-function parseSearchFilters($) {
-    const statusFilters = [];
-    const sortOptions = [];
-    const seenStatus = new Set();
-    const seenSort = new Set();
-
-    $('a.btn.btn-sm.btn-secondary').each((_, el) => {
-        const $el = $(el);
-        const href = cleanURL($el.attr('href'), BASE_URL);
-        const name = cleanHTML($el.text());
-        const active = $el.hasClass('active');
-        const url = href;
-        let status = null;
-        let sortBy = null;
-
-        try {
-            const parsed = new URL(href, BASE_URL);
-            status = parsed.searchParams.get('f[status]') || null;
-            sortBy = parsed.searchParams.get('f[sortby]') || null;
-        } catch {
-            // ignore invalid URLs
-        }
-
-        if (status && !seenStatus.has(status)) {
-            seenStatus.add(status);
-            statusFilters.push({ id: status, name, url, active, sortBy });
-        }
-
-        if (sortBy && !seenSort.has(sortBy)) {
-            seenSort.add(sortBy);
-            sortOptions.push({ id: sortBy, name, url, active, status });
-        }
-    });
-
-    return {
-        searchPageUrl: `${BASE_URL}/?act=search&f[status]=all&f[sortby]=lastest-manga`,
-        statusFilters,
-        sortOptions,
-    };
-}
-
 function errorResult(message, code, data = null) {
     return { status: 'error', error: { message, code }, data };
 }
@@ -174,7 +124,7 @@ class Hentairead {
         });
     }
 
-    async fetchPage(url) {
+    async fetchPage(url, usedFallback = false) {
         const resolved = cleanURL(url, this.baseUrl);
         const { data: html } = await this.http.get(resolved, {
             headers: { ...DEFAULT_HEADERS, Referer: this.baseUrl },
@@ -183,18 +133,24 @@ class Hentairead {
         if (typeof html !== 'string') throw new Error('Expected HTML string from server');
 
         if (LANDING_RE.test(html)) {
+            if (!usedFallback && this.baseUrl === BASE_URL) {
+                this.baseUrl = FALLBACK_URL;
+                const fallback = resolved.replace(BASE_URL, FALLBACK_URL);
+                return this.fetchPage(fallback, true);
+            }
             throw new Error('Received landing redirect page');
         }
 
         return cheerio.load(html);
     }
 
-    parseMangaCards($, limit = Infinity) {
+    // ─── Card Parser ───────────────────────────────────────────────────────
+
+    parseMangaCards($) {
         const items = [];
         const seen = new Set();
 
         $('.row .video .card').each((_, card) => {
-            if (items.length >= limit) return false;
             const $card = $(card);
             const $titleAnchor = $card.find('p.title-manga a').first();
             const link = cleanURL(
@@ -211,10 +167,9 @@ class Hentairead {
             const $chapter = $card.find('ul.list-group a.list-2-chap').first();
 
             items.push({
-                id: slug,
+                slug,
                 title,
-                url: link,
-                featuredImageUrl: cleanURL($img.attr('src') || $img.attr('data-src'), this.baseUrl),
+                imageUrl: cleanURL($img.attr('src') || $img.attr('data-src'), this.baseUrl) || null,
                 latestChapter:     cleanHTML($chapter.text()) || null,
                 latestChapterDate: cleanHTML($card.find('ul.list-group li').eq(1).find('cite').text()) || null,
             });
@@ -223,93 +178,93 @@ class Hentairead {
         return items;
     }
 
-    async getTopRankings() {
-        const key = 'top-rankings';
+    // ─── Latest Manga ──────────────────────────────────────────────────────
+
+    /**
+     * Get the latest manga releases.
+     * @param {number} [page=1]
+     * @param {number} [perPage=24]
+     * @returns {Promise<Object>}
+     */
+    async getLatestManga(page = 1, perPage = 24) {
+        const key = `latest:${page}:${perPage}`;
         if (caches.page.get(key)) return caches.page.get(key);
 
-        const sortTypes = {
-            month: 'top-month',
-            week:  'top-week',
-            day:   'top-day'
-        };
+        const $ = await this.fetchPage(
+            `${this.baseUrl}/?act=search&f[status]=all&f[sortby]=lastest-manga&pageNum=${page}`
+        );
+        return this._pageResult($, page, perPage, key);
+    }
 
-        const entries = await Promise.all(Object.entries(sortTypes).map(async ([label, sortBy]) => {
-            const $ = await this.fetchPage(buildSearchUrl({ status: 'all', sortBy, page: 1 }));
-            const items = this.parseMangaCards($, 10).map((item, index) => ({
-                id: item.id,
-                rank: index + 1,
-                title: item.title,
-                poster: item.featuredImageUrl,
-                latestChapter: item.latestChapter || null,
-                latestChapterDate: item.latestChapterDate || null
-            }));
-            return [label, items];
-        }));
+    // ─── Search ────────────────────────────────────────────────────────────
+
+    /**
+     * Search manga by keyword.
+     * @param {string} query
+     * @param {number} [page=1]
+     * @param {number} [perPage=24]
+     * @returns {Promise<Object>}
+     */
+    async searchManga(query, page = 1, perPage = 24) {
+        if (!query?.trim()) return errorResult('Query is required', 'MISSING_QUERY', []);
+
+        const key = `search:${query}:${page}:${perPage}`;
+        if (caches.page.get(key)) return caches.page.get(key);
+
+        const $ = await this.fetchPage(
+            `${this.baseUrl}/?act=search&f[status]=all&f[sortby]=lastest-manga&f[keyword]=${encodeURIComponent(query)}&pageNum=${page}`
+        );
+
+        const items = this.parseMangaCards($).slice(0, perPage);
+        const { totalPages } = extractPagination($, page);
 
         const result = {
-            status: 'success',
-            data: Object.fromEntries(entries)
+            provider: 'hentairead',
+            type: 'search',
+            data: {
+                query,
+                results: items,
+                pagination: {
+                    currentPage: page,
+                    totalPages,
+                    hasNextPage: page < totalPages,
+                    hasPreviousPage: page > 1,
+                },
+            },
         };
-
         caches.page.set(key, result);
         return result;
     }
 
-    async getLatestManga(page = 1, perPage = 24, status = 'all', sortBy = 'lastest-manga') {
-        const key = `latest:${page}:${perPage}:${status}:${sortBy}`;
-        if (caches.page.get(key)) return caches.page.get(key);
+    // ─── Internal page result builder ──────────────────────────────────────
 
-        const $ = await this.fetchPage(buildSearchUrl({ status, sortBy, page }));
-        const result = this._pageResult($, page, perPage, key);
-        result.data = result.data.map(({ url, ...item }) => item);
-        return result;
-    }
-
-    async getTopManga(type = 'day', page = 1, perPage = 24) {
-        const typeMap = new Map([
-            ['month', 'top-month'],
-            ['monthly', 'top-month'],
-            ['week', 'top-week'],
-            ['weekly', 'top-week'],
-            ['day', 'top-day'],
-            ['daily', 'top-day'],
-            ['all', 'top-day']
-        ]);
-
-        const sortBy = typeMap.get(type) || 'top-day';
-        const key = `top:${sortBy}:${page}:${perPage}`;
-        if (caches.page.get(key)) return caches.page.get(key);
-
-        const $ = await this.fetchPage(buildSearchUrl({ status: 'all', sortBy, page }));
-        const result = this._pageResult($, page, perPage, key);
-        result.data = result.data.map(({ url, ...item }) => item);
-        return result;
-    }
-
-    async searchManga(query, page = 1, perPage = 24, status = 'all', sortBy = 'lastest-manga') {
-        if (!query?.trim()) return errorResult('Query is required', 'MISSING_QUERY', []);
-
-        const key = `search:${query}:${page}:${perPage}:${status}:${sortBy}`;
-        if (caches.page.get(key)) return caches.page.get(key);
-
-        const $ = await this.fetchPage(buildSearchUrl({ query, status, sortBy, page }));
-        const result = this._pageResult($, page, perPage, key);
-        result.data = result.data.map(({ url, ...item }) => item);
-        return result;
-    }
-
-    _pageResult($, page, perPage, cacheKey) {
+    _pageResult($, page, perPage, cacheKey, extraFields = {}) {
         const items = this.parseMangaCards($).slice(0, perPage);
         const { totalPages } = extractPagination($, page);
         const result = {
-            status: 'success',
-            data: items,
-            pagination: { page, perPage, totalPages, count: items.length },
+            provider: 'hentairead',
+            type: 'manga-list',
+            data: {
+                ...extraFields,
+                results: items,
+                pagination: {
+                    currentPage: page,
+                    totalPages,
+                    hasNextPage: page < totalPages,
+                    hasPreviousPage: page > 1,
+                },
+            },
         };
         caches.page.set(cacheKey, result);
         return result;
     }
 
+    // ─── Genres ────────────────────────────────────────────────────────────
+
+    /**
+     * Get all available genre slugs.
+     * @returns {Promise<Object>}
+     */
     async getGenres() {
         const key = 'genres';
         if (caches.genres.get(key)) return caches.genres.get(key);
@@ -330,34 +285,26 @@ class Hentairead {
         slugs.sort((a, b) => a.localeCompare(b));
 
         const result = {
-            status: 'success',
+            provider: 'hentairead',
+            type: 'genre-list',
             data: {
-                provider: 'hentairead',
-                type: 'genre-list',
-                data: {
-                    totalCount: slugs.length,
-                    genres: slugs,
-                },
+                totalCount: slugs.length,
+                genres: slugs,
             },
         };
         caches.genres.set(key, result);
         return result;
     }
 
-    async getSearchFilters() {
-        const key = 'search-filters';
-        if (caches.page.get(key)) return caches.page.get(key);
+    // ─── Manga by Genre ────────────────────────────────────────────────────
 
-        const $ = await this.fetchPage(`${this.baseUrl}/?act=search&f[status]=all&f[sortby]=lastest-manga`);
-        const result = {
-            status: 'success',
-            data: parseSearchFilters($),
-        };
-
-        caches.page.set(key, result);
-        return result;
-    }
-
+    /**
+     * Get manga listings filtered by genre slug.
+     * @param {string} genreSlug
+     * @param {number} [page=1]
+     * @param {number} [perPage=24]
+     * @returns {Promise<Object>}
+     */
     async getMangaByGenre(genreSlug, page = 1, perPage = 24) {
         if (!genreSlug) return errorResult('Genre slug is required', 'MISSING_GENRE', []);
 
@@ -366,9 +313,16 @@ class Hentairead {
 
         const url = `${this.baseUrl}/genres/${genreSlug}/${page > 1 ? `?pageNum=${page}` : ''}`;
         const $ = await this.fetchPage(url);
-        return this._pageResult($, page, perPage, key);
+        return this._pageResult($, page, perPage, key, { genre: genreSlug });
     }
 
+    // ─── Manga Details ─────────────────────────────────────────────────────
+
+    /**
+     * Get full details for a manga by slug or URL.
+     * @param {string} identifier - Manga slug or full URL
+     * @returns {Promise<Object>}
+     */
     async getMangaDetails(identifier) {
         if (!identifier) return errorResult('Identifier is required', 'MISSING_IDENTIFIER');
 
@@ -383,69 +337,54 @@ class Hentairead {
             $('h1.entry-title, h1.post-title, .title-manga, .detail-title, .title').first().text() ||
             $('meta[property="og:title"]').attr('content')
         );
-        const featuredImageUrl = cleanURL(
+
+        const posterUrl = cleanURL(
             $('meta[property="og:image"]').attr('content') ||
             $('.thumb img, .summary_image img, .cover img').first().attr('src'),
             this.baseUrl
-        );
+        ) || null;
+
         const description = cleanHTML(
             $('.description-summary, .desc, .content, .summary-content, .story, #synopsis, #summary_shortened').first().text() ||
             $('meta[property="og:description"]').attr('content') ||
             $('meta[name="description"]').attr('content')
-        );
+        ) || null;
 
+        // Genres — array of slug strings to match hentaimama's genre format
         const genres = [];
         const genresSeen = new Set();
-
-        const $genreDetailSection = $('li.kind.row')
-            .filter((_, el) => /genres?/i.test(cleanHTML($(el).find('p.name, .name').text())))
-            .first();
-
-        if ($genreDetailSection.length) {
-            $genreDetailSection.find('a[href*="/genres/"]').each((_, el) => {
+        $('.list-group.list-group-flush')
+            .filter((_, el) => $(el).find('a[href*="/genres/"]').length > 0)
+            .first()
+            .find('a[href*="/genres/"]')
+            .each((_, el) => {
                 const $el = $(el);
-                const name = cleanHTML($el.text());
-                if (!name || genresSeen.has(name)) return;
-                genresSeen.add(name);
-                genres.push(name);
+                const gSlug = slugFromUrl(cleanURL($el.attr('href'), this.baseUrl), this.baseUrl);
+                if (!gSlug || gSlug === 'genres' || genresSeen.has(gSlug)) return;
+                genresSeen.add(gSlug);
+                genres.push(gSlug);
             });
-        }
 
-        if (!genres.length) {
-            $('.list-group.list-group-flush')
-                .filter((_, el) => /genres?/i.test($(el).text()) && $(el).find('a[href*="/genres/"]').length > 0)
-                .first()
-                .find('a[href*="/genres/"]')
-                .each((_, el) => {
-                    const $el = $(el);
-                    const name = cleanHTML($el.text());
-                    const gSlug = slugFromUrl(cleanURL($el.attr('href'), this.baseUrl), this.baseUrl);
-                    if (!name || !gSlug || gSlug === 'genres' || genresSeen.has(name)) return;
-                    genresSeen.add(name);
-                    genres.push(name);
-                });
-        }
+        const status = cleanHTML(
+            $('.status.row, li.status.row').first().find('p.col-8').first().text()
+        ) || null;
 
-        const statusText = cleanHTML($('.status.row, li.status.row').first().find('p.col-8').first().text()) || null;
-
+        // Chapters — ordered as listed on the page (newest first typically)
         const chapters = [];
-        const seen = new Set();
+        const chaptersSeen = new Set();
+
         const addChapter = ($anchor) => {
             const link = cleanURL($anchor.attr('href'), this.baseUrl);
             const cSlug = slugFromUrl(link, this.baseUrl);
-            if (!link || !cSlug || seen.has(cSlug)) return;
-            seen.add(cSlug);
-            const chapterDate = cleanHTML(
-                $anchor.closest('li').find('.chapter-release-date, cite').first().text()
-            ) || null;
+            if (!link || !cSlug || chaptersSeen.has(cSlug)) return;
+            chaptersSeen.add(cSlug);
             chapters.push({
-                id: cSlug,
-                title: cleanHTML($anchor.text() || $anchor.attr('title')),
-                datePublished: chapterDate,
+                slug: cSlug,
+                title: cleanHTML($anchor.text() || $anchor.attr('title')) || null,
+                releaseDate: cleanHTML($anchor.closest('li').find('cite').text()) || null,
             });
         };
 
-        // Try increasingly broad selectors
         const selectors = [
             '#nt_listchapter a[href*="/chapter-"]',
             '.list-chapter a[href*="/chapter-"]',
@@ -457,13 +396,17 @@ class Hentairead {
         }
 
         const result = {
-            status: 'success',
+            provider: 'hentairead',
+            type: 'manga-info',
             data: {
-                id: slug, title: title || slug,
+                id: slug,
+                slug,
+                title: title || slug,
+                posterUrl,
                 description,
-                featuredImageUrl,
-                status: statusText,
+                status,
                 genres,
+                totalChapters: chapters.length,
                 chapters,
             },
         };
@@ -471,6 +414,13 @@ class Hentairead {
         return result;
     }
 
+    // ─── Chapter Images ────────────────────────────────────────────────────
+
+    /**
+     * Get all page images for a chapter.
+     * @param {string} identifier - Chapter slug, full chapter URL, or manga slug (resolves to first chapter)
+     * @returns {Promise<Object>}
+     */
     async getChapterImages(identifier) {
         if (!identifier) return errorResult('Chapter identifier is required', 'MISSING_CHAPTER_IDENTIFIER', []);
 
@@ -481,7 +431,7 @@ class Hentairead {
             const details = await this.getMangaDetails(identifier);
             const firstChapter = details?.data?.chapters?.[0];
             if (!firstChapter) return errorResult('No chapter found for manga slug', 'NO_CHAPTER_FOR_SLUG', []);
-            chapterUrl = cleanURL(`${details.data.id}/${firstChapter.id}/`, this.baseUrl);
+            chapterUrl = cleanURL(`${details.data.id}/${firstChapter.slug}/`, this.baseUrl);
         }
 
         const key = `chapter:${chapterUrl}`;
@@ -512,22 +462,95 @@ class Hentairead {
         const images = normalizeImages(raw, this.baseUrl);
         if (!images.length) return errorResult('No chapter images found', 'NO_IMAGES', []);
 
+        const title = cleanHTML($('h1, title, .title').first().text()) || chapterUrl;
+
         const result = {
-            status: 'success',
-            data: images,
-            chapter: {
-                title: cleanHTML($('h1, title, .title').first().text()) || chapterUrl,
-                link: chapterUrl,
+            provider: 'hentairead',
+            type: 'chapter',
+            data: {
+                slug: slugFromUrl(chapterUrl, this.baseUrl),
+                title,
+                url: chapterUrl,
                 pageCount: images.length,
+                pages: images,
             },
         };
         caches.chapter.set(key, result);
         return result;
     }
 
+    // ─── Cache Management ──────────────────────────────────────────────────
+
     clearCaches() {
         Object.values(caches).forEach(c => c.clear());
     }
 }
 
-module.exports = { Hentairead };
+// ─── Module Exports (functional interface matching hentaimama style) ───────────
+
+const _instance = new Hentairead();
+
+/**
+ * Get the latest manga releases.
+ * @param {number} [page=1]
+ * @param {number} [perPage=24]
+ */
+const getLatestManga = (page = 1, perPage = 24) =>
+    _instance.getLatestManga(page, perPage);
+
+/**
+ * Search manga by keyword.
+ * @param {string} query
+ * @param {number} [page=1]
+ * @param {number} [perPage=24]
+ */
+const searchManga = (query, page = 1, perPage = 24) =>
+    _instance.searchManga(query, page, perPage);
+
+/**
+ * Get all available genre slugs.
+ */
+const getGenreList = () =>
+    _instance.getGenres();
+
+/**
+ * Get manga listings filtered by genre slug.
+ * @param {string} genreSlug
+ * @param {number} [page=1]
+ * @param {number} [perPage=24]
+ */
+const getMangaByGenre = (genreSlug, page = 1, perPage = 24) =>
+    _instance.getMangaByGenre(genreSlug, page, perPage);
+
+/**
+ * Get full details for a manga (title, description, genres, chapters, etc.).
+ * @param {string} identifier - Manga slug or full URL
+ */
+const getMangaInfo = (identifier) =>
+    _instance.getMangaDetails(identifier);
+
+/**
+ * Get all page images for a specific chapter.
+ * @param {string} identifier - Chapter slug, full chapter URL, or manga slug (resolves to first chapter)
+ */
+const getChapterPages = (identifier) =>
+    _instance.getChapterImages(identifier);
+
+/**
+ * Clear all internal LRU caches.
+ */
+const clearCaches = () =>
+    _instance.clearCaches();
+
+module.exports = {
+    // Functional API
+    getLatestManga,
+    searchManga,
+    getGenreList,
+    getMangaByGenre,
+    getMangaInfo,
+    getChapterPages,
+    clearCaches,
+    // Class export for advanced use
+    Hentairead,
+};

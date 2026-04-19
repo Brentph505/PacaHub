@@ -97,6 +97,60 @@ function cleanURL(url) {
     return cleaned || null;
 }
 
+function isValidActorTerm(term) {
+    if (!term || !term.name || !term.slug) {
+        return false;
+    }
+
+    const name = String(term.name).trim();
+    const slug = String(term.slug).trim().toLowerCase();
+
+    if (!name || !slug) {
+        return false;
+    }
+
+    if (name.startsWith('@')) {
+        return false;
+    }
+
+    if (slug === 'you') {
+        return false;
+    }
+
+    return true;
+}
+
+function resolveImageUrl($img, $article = null) {
+    if ($article && $article.attr('data-main-thumb')) {
+        const thumb = cleanURL($article.attr('data-main-thumb'));
+        if (thumb) return thumb;
+    }
+
+    if (!$img || !$img.length) return null;
+
+    const candidates = [
+        $img.attr('data-lazy-src'),
+        $img.attr('data-src'),
+        $img.attr('data-original'),
+        $img.attr('data-srcset'),
+        $img.attr('srcset'),
+        $img.attr('src')
+    ];
+
+    for (let candidate of candidates) {
+        if (!candidate) continue;
+        if (candidate.includes(',')) {
+            candidate = candidate.split(',')[0].trim().split(' ')[0];
+        }
+        const cleaned = cleanURL(candidate);
+        if (cleaned && !cleaned.startsWith('data:image/svg+xml')) {
+            return cleaned;
+        }
+    }
+
+    return null;
+}
+
 function extractVideoCode(title) {
     const match = title.match(/([A-Z]+[-_\s]\d+)/i);
     if (match) {
@@ -395,6 +449,9 @@ async function enhanceTaxonomyWithImage(term, taxonomyType, fetchImages = false)
 
 async function enhanceTaxonomyList(terms, taxonomyType, fetchImages = false) {
     if (!Array.isArray(terms) || terms.length === 0) return [];
+    if (taxonomyType === 'actors') {
+        terms = terms.filter(isValidActorTerm);
+    }
     // For categories and actors with images, process concurrently
     if ((taxonomyType === 'categories' || taxonomyType === 'actors') && fetchImages) {
         return processConcurrently(
@@ -585,10 +642,9 @@ async function scrapeRelatedContent(videoPath) {
             const $el = $(el);
             const a = $el.find('a').first();
             const href = a.attr('href') || '';
-            const imgSrc = $el.find('img').attr('data-src') || $el.find('img').attr('src');
+            const imageUrl = resolveImageUrl($el.find('img').first(), $el);
 
             // derive slug/id from href
-            let link = href ? cleanURL(href) : null;
             let slug = null;
             if (href) {
                 try {
@@ -604,7 +660,7 @@ async function scrapeRelatedContent(videoPath) {
 
             related_actors.push({
                 title: a.attr('title') || $el.find('.entry-header span').text().trim(),
-                thumbnail: cleanURL(imgSrc),
+                thumbnail: imageUrl,
                 id: slug
             });
         });
@@ -614,9 +670,8 @@ async function scrapeRelatedContent(videoPath) {
             const $el = $(el);
             const a = $el.find('a').first();
             const href = a.attr('href') || '';
-            const imgSrc = $el.find('img').attr('data-src') || $el.find('img').attr('src');
+            const imageUrl = resolveImageUrl($el.find('img').first(), $el);
 
-            let link = href ? cleanURL(href) : null;
             let slug = null;
             if (href) {
                 try {
@@ -633,7 +688,7 @@ async function scrapeRelatedContent(videoPath) {
 
             related.push({
                 title: a.attr('title') || $el.find('.entry-header span').text().trim(),
-                thumbnail: cleanURL(imgSrc),
+                thumbnail: imageUrl,
                 id: slug
             });
         });
@@ -832,7 +887,7 @@ async function getCategories(page = 1, perPage = 100) {
 
 async function getActors(page = 1, perPage = 20, search = null) {
     try {
-        const params = { page, per_page: perPage };
+        const params = { page, per_page: perPage, hide_empty: true };
         if (search) params.search = search;
         
         const { data, headers } = await axios.get(
@@ -844,12 +899,14 @@ async function getActors(page = 1, perPage = 20, search = null) {
         const totalItems = parseInt(headers['x-wp-total'] || 0);
 
         const actors = await enhanceTaxonomyList(
-            data.map(actor => ({
-                name: actor.name,
-                slug: actor.slug,
-                count: actor.count || 0,
-                description: actor.description || ''
-            })),
+            data
+                .filter(isValidActorTerm)
+                .map(actor => ({
+                    name: actor.name,
+                    slug: actor.slug,
+                    count: actor.count || 0,
+                    description: actor.description || ''
+                })),
             'actors',
             true // enable image/photo fetching for actors
         );

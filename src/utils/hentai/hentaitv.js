@@ -53,13 +53,15 @@ function extractPhpPlayer(html) {
             while ((base64Match = base64Pattern.exec(html))) {
                 try {
                     const decoded = Buffer.from(base64Match[1], 'base64').toString('utf-8');
-                    const videoUrl = decoded.match(/(https?:\/\/[^\s"']+\.(?:mp4|m3u8))/i);
+                    const videoUrl = decoded.match(/(https?:\/\/[^"]*?\.(?:mp4|m3u8)(?:\?[^"']*)?)/i);
                     if (videoUrl && videoUrl[1]) {
                         video = videoUrl[1];
                         console.log('Found base64 encoded video:', video.substring(0, 100));
                         break;
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // ignore invalid base64
+                }
             }
         }
 
@@ -287,4 +289,4 @@ async function scrapeHentaiTV(url) {
     }
 }
 
-module.exports = { scrapeHentaiTV };
+exports.scrapeHentaiTV = scrapeHentaiTV;

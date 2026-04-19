@@ -323,18 +323,35 @@ const scrapeInfo = async (id) => {
 const scrapeEpisode = async (id) => {
     const url = `${BASE_URL}/episodes/${id}/`;
     try {
-        const response = await safeGet(url, { validateStatus: () => true });
-        
-        // Check if page was found
-        if (response.status === 404 || response.data.includes('Page not found')) {
+        // perform up to 3 attempts when encountering server errors
+        let response;
+        let attempt = 0;
+        do {
+            response = await safeGet(url, { validateStatus: () => true });
+            if (response.status >= 500 && attempt < 2) {
+                // transient server error, wait and retry
+                await sleep(500 * (attempt + 1));
+                attempt++;
+                continue;
+            }
+            break;
+        } while (attempt < 3);
+
+        // basic status checks
+        if (response.status === 404 || (response.data && response.data.includes('Page not found'))) {
             throw new Error(`Episode not found: ${id} (404)`);
         }
-        
+        // If we got a server error but the page still contains episode markup, continue parsing
+        let data = response.data;
         if (response.status !== 200) {
-            throw new Error(`Failed to fetch episode: HTTP ${response.status}`);
+            const lookFor = 'episode-series-img';
+            if (data && data.includes(lookFor)) {
+                console.warn(`Warning: received ${response.status} for episode ${id} but page contains expected content, proceeding with parse`);
+            } else {
+                throw new Error(`Failed to fetch episode: HTTP ${response.status}`);
+            }
         }
-        
-        const data = response.data;
+
         const $ = cheerio.load(data);
 
     // Title
@@ -1263,10 +1280,14 @@ const getVideoSources = async (episodeId) => {
         const data = response.data;
 
         let playerContent;
+        let warnedJson = false;
         try {
             playerContent = JSON.parse(data);
         } catch (e) {
-            console.warn('Response was not JSON, treating as HTML content');
+            if (!warnedJson) {
+                console.warn('Response was not JSON, treating as HTML content');
+                warnedJson = true;
+            }
             playerContent = Array.isArray(data) ? data : [data];
         }
 
